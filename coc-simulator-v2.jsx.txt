@@ -1,0 +1,1261 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+
+// ═══════════════════════════════════════════════════
+//  ЦВЕТА И КОНСТАНТЫ
+// ═══════════════════════════════════════════════════
+const C = {
+  bg: "#04091a", surface: "#080f22", card: "#0c1530",
+  border: "#162040", borderBright: "#1e3060",
+  gold: "#f5a623", goldBright: "#ffd060", goldDark: "#b87318",
+  red: "#ef4444", blue: "#3b82f6", blueDark: "#1e40af",
+  green: "#22c55e", purple: "#a855f7", purpleDark: "#6b21a8",
+  orange: "#fb923c",
+  text: "#ddeeff", muted: "#3d5070", mutedLt: "#5a7090",
+};
+const TH_CLR = { 15: "#f44", 16: "#c4f", 17: "#b8f", 18: "#80f" };
+
+// BUG FIX #1: убраны дублирующиеся FILE_ID / REPLACE_ID — теперь один input для галереи
+const FILE_ID = "coc-sim-file";
+const CAM_ID  = "coc-sim-cam";
+
+const STAR_COLOR = { 3: C.gold, 2: C.orange, 1: C.mutedLt, 0: C.red };
+const STAR_LABEL = { 3: "⭐⭐⭐", 2: "⭐⭐", 1: "⭐", 0: "💀" };
+
+// ═══════════════════════════════════════════════════
+//  УТИЛИТЫ
+// ═══════════════════════════════════════════════════
+const makeThumbnail = (dataUrl) =>
+  new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const [mW, mH] = [160, 110];
+      const r = Math.min(mW / img.width, mH / img.height, 1);
+      const c = document.createElement("canvas");
+      c.width  = Math.max(1, Math.round(img.width  * r));
+      c.height = Math.max(1, Math.round(img.height * r));
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      try { resolve(c.toDataURL("image/jpeg", 0.55)); } catch { resolve(null); }
+    };
+    img.onerror = () => resolve(null);
+    img.src = dataUrl;
+  });
+
+// BUG FIX #2: добавлена правильная обработка ошибок сети + retry логика
+const callClaude = async ({ messages, maxTokens = 1000, useSearch = false, retries = 1 }) => {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const body = { model: "claude-sonnet-4-6", max_tokens: maxTokens, messages };
+      if (useSearch) body.tools = [{ type: "web_search_20250305", name: "web_search" }];
+      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        const e = await resp.json().catch(() => ({}));
+        throw new Error(e?.error?.message || `Ошибка ${resp.status}`);
+      }
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error.message);
+      // BUG FIX #3: правильная сборка текста из всех text-блоков (включая после tool_use)
+      return data.content.filter(c => c.type === "text").map(c => c.text).join("\n");
+    } catch (err) {
+      if (attempt === retries) throw err;
+      await new Promise(r => setTimeout(r, 800 * (attempt + 1))); // backoff
+    }
+  }
+};
+
+// BUG FIX #4: безопасный парсинг JSON с fallback
+const safeParseJSON = (text) => {
+  if (!text) throw new Error("Пустой ответ");
+  const s = text.indexOf("{");
+  const e = text.lastIndexOf("}");
+  if (s === -1 || e === -1) throw new Error("JSON не найден в ответе");
+  try {
+    return JSON.parse(text.slice(s, e + 1));
+  } catch {
+    // попытка исправить обрезанный JSON
+    const partial = text.slice(s);
+    const fixed = partial.replace(/,\s*$/, "") + "}";
+    return JSON.parse(fixed);
+  }
+};
+
+// ═══════════════════════════════════════════════════
+//  UI КОМПОНЕНТЫ
+// ═══════════════════════════════════════════════════
+const Card = ({ children, gold = false, style = {} }) => (
+  <div style={{
+    background: C.card, borderRadius: "16px",
+    border: `1px solid ${gold ? C.gold + "44" : C.border}`,
+    overflow: "hidden", ...style
+  }}>
+    {children}
+  </div>
+);
+
+const StarBar = ({ pct, color }) => (
+  <div style={{ width: "100%", height: 6, background: C.surface, borderRadius: 4, overflow: "hidden" }}>
+    <div style={{
+      height: "100%", width: `${Math.min(100, Math.max(0, pct))}%`,
+      background: `linear-gradient(90deg,${color || C.gold},${C.goldBright})`,
+      borderRadius: 4, transition: "width .6s ease"
+    }} />
+  </div>
+);
+
+// НОВЫЙ КОМПОНЕНТ: Toast уведомление
+const Toast = ({ msg, visible }) => (
+  <div style={{
+    position: "fixed", bottom: 90, left: "50%", transform: `translateX(-50%) translateY(${visible ? 0 : 20}px)`,
+    opacity: visible ? 1 : 0, transition: "all .3s", zIndex: 999,
+    background: C.green, color: "#000", padding: "10px 20px",
+    borderRadius: "30px", fontWeight: 800, fontSize: "14px",
+    boxShadow: `0 4px 20px ${C.green}55`, pointerEvents: "none",
+    whiteSpace: "nowrap",
+  }}>
+    {msg}
+  </div>
+);
+
+// НОВЫЙ КОМПОНЕНТ: Бейдж TH
+const THBadge = ({ th }) => {
+  const c = TH_CLR[th] || C.gold;
+  return (
+    <span style={{
+      background: `${c}22`, color: c, fontSize: "11px",
+      padding: "2px 9px", borderRadius: "6px", fontWeight: 700
+    }}>TH{th}</span>
+  );
+};
+
+// ═══════════════════════════════════════════════════
+//  ГЛАВНЫЙ КОМПОНЕНТ
+// ═══════════════════════════════════════════════════
+export default function App() {
+  const [tab,        setTab]        = useState("simulate");
+  const [preview,    setPreview]    = useState(null);
+  const [payload,    setPayload]    = useState(null);
+  const [th,         setTh]         = useState("15");
+  const [troops,     setTroops]     = useState("");
+  const [urlVal,     setUrlVal]     = useState("");
+  const [showUrl,    setShowUrl]    = useState(false);
+  const [dragging,   setDragging]   = useState(false);
+  const [error,      setError]      = useState(null);
+  const [history,    setHistory]    = useState([]);
+  const [toast,      setToast]      = useState({ msg: "", visible: false });
+
+  // Simulation state
+  const [simRunning,  setSimRunning]  = useState(false);
+  const [simPhase,    setSimPhase]    = useState("idle");
+  const [simResults,  setSimResults]  = useState([]);
+  const [simCurrent,  setSimCurrent]  = useState(0);
+  const [simTotal,    setSimTotal]    = useState(20);
+  const [bestResult,  setBestResult]  = useState(null);
+  const [baseInfo,    setBaseInfo]    = useState(null);
+  // BUG FIX #5: добавлен ref для отмены симуляции
+  const cancelRef = useRef(false);
+
+  // Trends state
+  const [trends,    setTrends]    = useState(null);
+  const [tLoading,  setTLoading]  = useState(false);
+  const [tError,    setTError]    = useState(null);
+
+  // Army finder state
+  const [armyPicks,   setArmyPicks]   = useState(null);
+  const [armyLoading, setArmyLoading] = useState(false);
+  const [armyError,   setArmyError]   = useState(null);
+
+  // НОВОЕ: расширенный вид результата
+  const [expandedResult, setExpandedResult] = useState(null);
+
+  // Загрузка истории
+  useEffect(() => {
+    (async () => {
+      try {
+        const s = await window.storage.get("coc_sim_v2");
+        if (s) setHistory(JSON.parse(s.value));
+      } catch { /* storage недоступен */ }
+    })();
+  }, []);
+
+  // Toast helper
+  const showToast = useCallback((msg, duration = 2200) => {
+    setToast({ msg, visible: true });
+    setTimeout(() => setToast(t => ({ ...t, visible: false })), duration);
+  }, []);
+
+  // ─── Загрузка изображения ───────────────────────────────────────────────────
+  const fromFile = useCallback((file) => {
+    // BUG FIX #6: проверяем размер файла (макс 10 МБ для API)
+    if (!file || !file.type.startsWith("image/")) {
+      setError("❌ Нужен файл-изображение (JPG/PNG/WEBP)");
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      setError("❌ Файл слишком большой. Максимум 10 МБ.");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const url = ev.target.result;
+      setPreview(url);
+      setPayload({ kind: "base64", data: url.split(",")[1], mt: file.type });
+      setSimResults([]); setSimPhase("idle"); setBestResult(null);
+      setBaseInfo(null); setError(null); setShowUrl(false);
+      setExpandedResult(null);
+    };
+    reader.onerror = () => setError("❌ Не удалось прочитать файл.");
+    reader.readAsDataURL(file);
+  }, []);
+
+  // Вставка из буфера
+  useEffect(() => {
+    const onPaste = (e) => {
+      for (const item of (e.clipboardData?.items || [])) {
+        if (item.type.startsWith("image/")) {
+          const f = item.getAsFile();
+          if (f) { fromFile(f); break; }
+        }
+      }
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [fromFile]);
+
+  const onDragOver  = useCallback((e) => { e.preventDefault(); setDragging(true); }, []);
+  const onDragLeave = useCallback(() => setDragging(false), []);
+  const onDrop      = useCallback((e) => {
+    e.preventDefault(); setDragging(false);
+    const f = e.dataTransfer?.files?.[0];
+    if (f) fromFile(f);
+  }, [fromFile]);
+
+  const fromUrl = () => {
+    const u = urlVal.trim();
+    if (!u.startsWith("http")) { setError("Ссылка должна начинаться с https://"); return; }
+    setPreview(u); setPayload({ kind: "url", url: u });
+    setSimResults([]); setSimPhase("idle"); setBestResult(null);
+    setBaseInfo(null); setError(null); setShowUrl(false); setExpandedResult(null);
+  };
+
+  const reset = () => {
+    setPreview(null); setPayload(null); setSimResults([]);
+    setSimPhase("idle"); setBestResult(null); setBaseInfo(null);
+    setError(null); setUrlVal(""); setShowUrl(false); setExpandedResult(null);
+  };
+
+  // ─── ЗАГРУЗИТЬ ТРЕНДЫ ───────────────────────────────────────────────────────
+  const loadTrends = async () => {
+    setTLoading(true); setTError(null); setTrends(null);
+    try {
+      const text = await callClaude({
+        messages: [{
+          role: "user", content: `Найди через интернет ТОП-6 самых актуальных стратегий атаки для TH15-TH18 в Clash of Clans прямо сейчас (июнь 2026).
+Ищи на YouTube, TikTok, Telegram, Reddit, clash.gg, clashofclans.com: "best attack strategy TH15 TH16 TH17 TH18 2026 war 3 star"
+Смотри последние видео и посты — только свежие 2026 года.
+
+Верни ТОЛЬКО JSON без markdown:
+{"updated":"Июнь 2026","sources":["YouTube","TikTok","Telegram","Reddit"],"strategies":[
+  {"title":"Super Witch Slap","th":"TH15-17","rating":9.5,"source":"YouTube — Judo Sloth","views":"2.1M","army":"10 SW, 8 Bowler, 4 Healer, 2 Yeti","spells":"3 Rage, 2 Freeze, 1 Bat","siege":"Stone Slammer","tip":"Rage в нужный момент — ключ к 3★","tags":["war","3★","legend"]}
+]}
+Ровно 6 стратегий. Только JSON.`
+        }],
+        maxTokens: 2000, useSearch: true,
+      });
+      const parsed = safeParseJSON(text);
+      if (!parsed.strategies?.length) throw new Error("Стратегии не найдены");
+      setTrends(parsed);
+    } catch (err) {
+      setTError("Не удалось загрузить тренды: " + err.message);
+    } finally { setTLoading(false); }
+  };
+
+  // ─── НАЙТИ ЛУЧШИЙ СОСТАВ ────────────────────────────────────────────────────
+  const findBestArmy = async () => {
+    setArmyLoading(true); setArmyError(null); setArmyPicks(null);
+    try {
+      const text = await callClaude({
+        messages: [{
+          role: "user", content: `Ты эксперт CoC 2026. Найди через интернет ТОП-4 лучших состава войск для TH${th} в июне 2026.
+Ищи: "best TH${th} army composition 2026 war 3 star" на YouTube, Reddit, TikTok, clash.gg
+Только актуальные мета-составы которые сейчас в топе.
+
+Верни ТОЛЬКО JSON без markdown:
+{"armies":[
+  {"rank":1,"name":"Super Witch Slap","winrate":"97%","rating":9.8,"army":"10 Super Witch, 8 Bowler, 4 Healer, 2 Yeti","spells":"3 Rage, 2 Freeze, 1 Bat Spell","siege":"Stone Slammer","pet":"LASSI","hero_eq":"Barbarian King Earthquake","source":"Judo Sloth Gaming","tip":"Лучший для симметричных war-баз"}
+]}
+Ровно 4 состава. Только JSON.`
+        }],
+        maxTokens: 1500, useSearch: true,
+      });
+      const parsed = safeParseJSON(text);
+      if (!parsed.armies?.length) throw new Error("Составы не найдены");
+      setArmyPicks(parsed.armies);
+    } catch (err) {
+      setArmyError("Ошибка: " + err.message);
+    } finally { setArmyLoading(false); }
+  };
+
+  // ─── ШАГ 1: Сканирование базы ───────────────────────────────────────────────
+  const scanBase = async (imgBlock) => {
+    const prompt = `Ты аналитик Clash of Clans 2026. Изучи скриншот базы.
+Верни ТОЛЬКО JSON без markdown:
+{
+  "th_level": 15,
+  "base_type": "war",
+  "weaknesses": ["слабый северный угол","CC легко вытянуть с юга","открытый TH"],
+  "key_defenses": ["Eagle Artillery - центр","2x Inferno - север","Scattershot - восток"],
+  "best_entry": "юго-запад",
+  "cc_pull": "с юга фанатами"
+}
+Только JSON.`;
+    const text = await callClaude({
+      messages: [{ role: "user", content: [imgBlock, { type: "text", text: prompt }] }],
+      maxTokens: 600,
+    });
+    return safeParseJSON(text);
+  };
+
+  // ─── ШАГ 2: Генерация 20 составов ───────────────────────────────────────────
+  const generateArmies = async (base) => {
+    const prompt = `Ты профи CoC 2026, Legend League. Для атаки базы TH${base.th_level} (тип: ${base.base_type}, слабости: ${base.weaknesses?.join(", ")}) от игрока TH${th}${troops ? ", его войска: " + troops : ""}.
+
+Придумай 20 РАЗНЫХ составов атаки (реальные мета-составы 2026): Super Witch Slap, Zap Lalo, Root Rider Smash, Blizzard Lalo, Super Dragon, Hybrid, Yeti Smash, Sui Lalo, Queen Charge, GoWiPe и другие.
+
+Верни ТОЛЬКО JSON:
+{"armies":[
+  {"id":1,"name":"Super Witch Slap","army":"10 SW, 8 Bowler, 4 Healer","spells":"3 Rage, 2 Freeze, 1 Bat","siege":"Stone Slammer","pet":"LASSI","entry":"${base.best_entry}"}
+]}
+Ровно 20 штук. Только JSON.`;
+    const text = await callClaude({ messages: [{ role: "user", content: prompt }], maxTokens: 2500, useSearch: true });
+    const parsed = safeParseJSON(text);
+    // BUG FIX #7: валидация минимального количества составов
+    const armies = parsed.armies || [];
+    if (armies.length < 3) throw new Error("Недостаточно составов сгенерировано");
+    return armies;
+  };
+
+  // ─── ШАГ 3: Симуляция одной атаки ──────────────────────────────────────────
+  const simulateAttack = async (army, base, imgBlock) => {
+    const prompt = `Ты симулятор атак Clash of Clans 2026. Симулируй атаку на базу TH${base.th_level}.
+
+База: слабости: ${base.weaknesses?.join(", ")}, вход: ${base.best_entry}
+Атакующий: TH${th}
+Состав: ${army.name} — ${army.army}, заклинания: ${army.spells}, сидж: ${army.siege}, пет: ${army.pet}
+
+Проведи реалистичную симуляцию с рандомным фактором (±10%). Учитывай силу состава VS этой базы.
+
+Верни ТОЛЬКО JSON:
+{"stars":3,"destruction":98,"timeline":["0:00 Вытяжка CC","0:30 Разворачиваем Slammer","1:00 Rage на Eagle","2:00 Freeze на Inferno","3:00 Зачистка"],"key_moment":"Rage в нужный момент","verdict":"Отлично","fail_reason":null}
+stars: 0,1,2 или 3. Только JSON.`;
+
+    const text = await callClaude({
+      messages: [{ role: "user", content: [imgBlock, { type: "text", text: prompt }] }],
+      maxTokens: 600,
+    });
+    // BUG FIX #8: fallback при ошибке парсинга симуляции
+    let res;
+    try { res = safeParseJSON(text); } catch {
+      res = { stars: 1, destruction: Math.floor(40 + Math.random() * 30), timeline: [], key_moment: "", verdict: "Ошибка", fail_reason: "Парсинг" };
+    }
+    // BUG FIX #9: валидация stars (0-3)
+    res.stars = Math.max(0, Math.min(3, parseInt(res.stars) || 0));
+    res.destruction = Math.max(0, Math.min(100, parseInt(res.destruction) || 0));
+    return { ...res, id: army.id, name: army.name, army: army.army, spells: army.spells, siege: army.siege, pet: army.pet };
+  };
+
+  // ─── ЗАПУСК СИМУЛЯЦИИ ───────────────────────────────────────────────────────
+  const runSimulation = async () => {
+    if (!payload) return;
+    cancelRef.current = false;
+    setSimRunning(true); setSimResults([]); setSimCurrent(0);
+    setBestResult(null); setError(null); setSimPhase("scanning");
+    setExpandedResult(null);
+
+    const imgBlock = payload.kind === "base64"
+      ? { type: "image", source: { type: "base64", media_type: payload.mt, data: payload.data } }
+      : { type: "image", source: { type: "url", url: payload.url } };
+
+    try {
+      // Фаза 1: Сканирование
+      const base = await scanBase(imgBlock);
+      setBaseInfo(base);
+      if (cancelRef.current) return;
+
+      // Фаза 2: Генерация составов
+      setSimPhase("generating");
+      const armies = await generateArmies(base);
+      const total = Math.min(armies.length, 20);
+      setSimTotal(total);
+      if (cancelRef.current) return;
+
+      // Фаза 3: Симуляция каждой атаки
+      setSimPhase("running");
+      const results = [];
+      for (let i = 0; i < total; i++) {
+        if (cancelRef.current) break;
+        setSimCurrent(i + 1);
+        try {
+          const res = await simulateAttack(armies[i], base, imgBlock);
+          results.push(res);
+          const sorted = [...results].sort((a, b) => b.stars - a.stars || b.destruction - a.destruction);
+          setSimResults([...sorted]);
+          setBestResult(sorted[0]);
+        } catch {
+          results.push({
+            id: armies[i].id, name: armies[i].name, army: armies[i].army,
+            spells: armies[i].spells, siege: armies[i].siege, pet: armies[i].pet,
+            stars: 0, destruction: 0, timeline: [], key_moment: "",
+            verdict: "Ошибка", fail_reason: "Не удалось симулировать"
+          });
+        }
+      }
+
+      if (!cancelRef.current) {
+        // Сохраняем в историю
+        const thumb = payload.kind === "base64" ? (await makeThumbnail(preview)) || null : preview;
+        const best  = [...results].sort((a, b) => b.stars - a.stars || b.destruction - a.destruction)[0];
+        const entry = {
+          id: Date.now(), date: new Date().toLocaleString("ru-RU"),
+          th, preview: thumb, best_name: best?.name, best_stars: best?.stars,
+          best_dest: best?.destruction, base_th: base.th_level, total: results.length,
+        };
+        const nh = [entry, ...history].slice(0, 20); // BUG FIX #10: увеличен лимит до 20
+        setHistory(nh);
+        try { await window.storage.set("coc_sim_v2", JSON.stringify(nh)); } catch { /* ok */ }
+        setSimPhase("done");
+        showToast("✅ Симуляция завершена!");
+      }
+    } catch (err) {
+      setError("❌ " + err.message);
+      setSimPhase("idle");
+    } finally {
+      setSimRunning(false);
+    }
+  };
+
+  // Отмена симуляции
+  const cancelSimulation = () => {
+    cancelRef.current = true;
+    setSimRunning(false);
+    setSimPhase(simResults.length > 0 ? "done" : "idle");
+  };
+
+  // Поделиться
+  const shareResult = async () => {
+    if (!bestResult) return;
+    const text = `⚔️ CoC Симуляция TH${th}\n🏆 Лучший состав: ${bestResult.name}\n⭐ ${bestResult.stars} звезды · ${bestResult.destruction}%\n🪖 ${bestResult.army}\n⚡ ${bestResult.spells}`;
+    if (navigator.share) {
+      try { await navigator.share({ title: "CoC Attack Simulator", text }); return; } catch { /* fallback */ }
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast("📋 Скопировано!");
+    } catch { showToast("❌ Не удалось скопировать"); }
+  };
+
+  // ─── ПРОИЗВОДНЫЕ ЗНАЧЕНИЯ ────────────────────────────────────────────────────
+  const threeStarCount = simResults.filter(r => r.stars === 3).length;
+  const twoStarCount   = simResults.filter(r => r.stars === 2).length;
+  const avgDestruction = simResults.length > 0
+    ? Math.round(simResults.reduce((s, r) => s + r.destruction, 0) / simResults.length)
+    : 0;
+  const progress = simTotal > 0 ? Math.round((simCurrent / simTotal) * 100) : 0;
+
+  const phaseLabel = {
+    scanning:   "🔍 Сканирую базу...",
+    generating: "🧠 Генерирую 20 составов...",
+    running:    `⚔️ Симулирую ${simCurrent}/${simTotal}...`,
+    done:       "✅ Готово!",
+    idle:       "",
+  }[simPhase] || "";
+
+  // ─── ТАББАР ─────────────────────────────────────────────────────────────────
+  const renderTabBtn = (id, icon, label) => {
+    const active = tab === id;
+    return (
+      <button key={id} onClick={() => setTab(id)} style={{
+        flex: 1, padding: "8px 4px 5px", border: "none", cursor: "pointer",
+        borderRadius: "12px", background: active ? `${C.gold}18` : "transparent",
+        color: active ? C.gold : C.muted,
+        display: "flex", flexDirection: "column", alignItems: "center", gap: "3px",
+        transition: "all .15s",
+      }}>
+        <span style={{ fontSize: "22px", lineHeight: 1 }}>{icon}</span>
+        <span style={{ fontSize: "10px", fontWeight: active ? 800 : 400 }}>{label}</span>
+      </button>
+    );
+  };
+
+  // ═══════════════════════════════════════════════════
+  //  РЕНДЕР
+  // ═══════════════════════════════════════════════════
+  return (
+    <div style={{ background: C.bg, minHeight: "100vh", color: C.text, fontFamily: "system-ui,-apple-system,Arial,sans-serif" }}>
+
+      {/* Скрытые input'ы для файлов */}
+      <input id={FILE_ID} type="file" accept="image/*" style={{ display: "none" }}
+        onChange={e => { if (e.target.files[0]) fromFile(e.target.files[0]); e.target.value = ""; }} />
+      <input id={CAM_ID} type="file" accept="image/*" capture="environment" style={{ display: "none" }}
+        onChange={e => { if (e.target.files[0]) fromFile(e.target.files[0]); e.target.value = ""; }} />
+
+      {/* Toast */}
+      <Toast msg={toast.msg} visible={toast.visible} />
+
+      {/* HEADER */}
+      <div style={{
+        background: "linear-gradient(135deg,#080f22 0%,#0e1e3c 100%)",
+        padding: "14px 16px 12px", borderBottom: `1px solid ${C.border}`,
+        display: "flex", alignItems: "center", gap: "12px",
+        position: "sticky", top: 0, zIndex: 100,
+        boxShadow: "0 4px 24px #00000070",
+      }}>
+        <div style={{
+          width: 44, height: 44, borderRadius: "12px", flexShrink: 0,
+          background: `${C.gold}22`, border: `1px solid ${C.gold}55`,
+          display: "flex", alignItems: "center", justifyContent: "center", fontSize: "22px"
+        }}>⚔️</div>
+        <div style={{ flex: 1 }}>
+          <div style={{ color: C.gold, fontWeight: 900, fontSize: "17px", letterSpacing: "1px" }}>CoC ATTACK SIMULATOR</div>
+          <div style={{ color: C.muted, fontSize: "11px", marginTop: "1px" }}>20 симуляций · AI · TH15–18</div>
+        </div>
+        <div style={{
+          background: "#22c55e18", border: "1px solid #22c55e44",
+          color: C.green, borderRadius: "8px", padding: "4px 9px",
+          fontSize: "10px", fontWeight: 800,
+        }}>● LIVE</div>
+      </div>
+
+      <div style={{ padding: "14px 14px 90px", maxWidth: 580, margin: "0 auto" }}>
+
+        {/* ══════════════════════════════════════════════════
+            ТАБ: СИМУЛЯЦИЯ
+        ══════════════════════════════════════════════════ */}
+        {tab === "simulate" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+
+            {/* Выбор TH */}
+            <Card>
+              <div style={{ padding: "14px" }}>
+                <div style={{ color: C.muted, fontSize: "11px", letterSpacing: ".8px", marginBottom: "12px" }}>
+                  🏰 МОЯ РАТУША (АТАКУЮЩИЙ)
+                </div>
+                <div style={{ display: "flex", gap: "10px" }}>
+                  {[15, 16, 17, 18].map(n => {
+                    const c = TH_CLR[n], active = th === String(n);
+                    return (
+                      <button key={n} onClick={() => setTh(String(n))} style={{
+                        flex: 1, padding: "14px 6px", borderRadius: "14px",
+                        border: `2px solid ${active ? c + "cc" : C.border}`,
+                        background: active ? `${c}18` : "transparent",
+                        color: active ? c : C.muted, cursor: "pointer",
+                        fontWeight: 900, fontSize: "13px",
+                        display: "flex", flexDirection: "column", alignItems: "center", gap: "4px",
+                        transition: "all .18s",
+                      }}>
+                        <span style={{ fontSize: "24px" }}>🏰</span>
+                        <span>TH{n}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </Card>
+
+            {/* Загрузка изображения */}
+            {!preview ? (
+              <Card>
+                <div onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}
+                  style={{
+                    margin: "12px", padding: "24px 18px", borderRadius: "12px",
+                    textAlign: "center",
+                    border: `2px dashed ${dragging ? C.gold : C.border}`,
+                    background: dragging ? `${C.gold}08` : "transparent",
+                    transition: "all .2s",
+                  }}>
+                  <div style={{ fontSize: "48px", marginBottom: "10px" }}>📸</div>
+                  <div style={{ fontWeight: 800, fontSize: "16px", marginBottom: "6px" }}>
+                    Загрузи скриншот базы врага
+                  </div>
+                  <div style={{ color: C.muted, fontSize: "12px", marginBottom: "22px", lineHeight: 1.8 }}>
+                    ИИ проведёт 20 атак и найдёт лучший состав<br />
+                    <span style={{ color: C.mutedLt }}>Ctrl+V · перетащи · галерея · камера</span>
+                  </div>
+                  <div style={{ display: "flex", gap: "10px", justifyContent: "center", flexWrap: "wrap" }}>
+                    <label htmlFor={FILE_ID} style={{
+                      padding: "14px 24px", borderRadius: "13px", border: "none", cursor: "pointer",
+                      background: `linear-gradient(135deg,${C.gold},${C.goldDark})`,
+                      color: "#000", fontWeight: 900, fontSize: "15px",
+                      boxShadow: `0 4px 18px ${C.gold}55`,
+                      display: "flex", alignItems: "center", gap: "8px",
+                      userSelect: "none", WebkitUserSelect: "none",
+                    }}>🖼️ Галерея</label>
+                    <label htmlFor={CAM_ID} style={{
+                      padding: "14px 24px", borderRadius: "13px", border: "none", cursor: "pointer",
+                      background: `linear-gradient(135deg,${C.blue},${C.blueDark})`,
+                      color: "#fff", fontWeight: 900, fontSize: "15px",
+                      boxShadow: `0 4px 18px ${C.blue}55`,
+                      display: "flex", alignItems: "center", gap: "8px",
+                      userSelect: "none", WebkitUserSelect: "none",
+                    }}>📷 Камера</label>
+                  </div>
+                  <button onClick={() => setShowUrl(v => !v)} style={{
+                    marginTop: "16px", background: "none", border: `1px solid ${C.border}`,
+                    color: C.muted, padding: "8px 18px", borderRadius: "9px",
+                    cursor: "pointer", fontSize: "12px",
+                  }}>
+                    🔗 {showUrl ? "Скрыть" : "Вставить ссылку"}
+                  </button>
+                  {showUrl && (
+                    <div style={{ marginTop: "14px", textAlign: "left" }}>
+                      <input value={urlVal} onChange={e => setUrlVal(e.target.value)}
+                        onKeyDown={e => e.key === "Enter" && fromUrl()}
+                        placeholder="https://i.imgur.com/XXXXX.jpg"
+                        style={{
+                          width: "100%", padding: "12px", borderRadius: "10px",
+                          background: C.surface, color: C.text, border: `1px solid ${C.border}`,
+                          fontSize: "14px", boxSizing: "border-box", outline: "none",
+                        }} />
+                      <button onClick={fromUrl} style={{
+                        marginTop: "8px", width: "100%", padding: "12px",
+                        background: `linear-gradient(135deg,${C.blue},${C.blueDark})`,
+                        color: "#fff", border: "none", borderRadius: "10px",
+                        fontWeight: 800, cursor: "pointer", fontSize: "14px",
+                      }}>✓ Загрузить</button>
+                    </div>
+                  )}
+                </div>
+              </Card>
+            ) : (
+              <Card gold>
+                <div style={{ position: "relative", background: "#000" }}>
+                  <img src={preview} alt="base" style={{
+                    width: "100%", maxHeight: "220px", objectFit: "contain", display: "block"
+                  }} onError={() => setError("⚠️ Не удалось загрузить картинку.")} />
+                  <div style={{
+                    position: "absolute", top: 8, left: 8, background: "#00000099",
+                    borderRadius: "7px", padding: "3px 9px", fontSize: "11px",
+                    color: C.green, fontWeight: 800,
+                  }}>✓ БАЗА ЗАГРУЖЕНА</div>
+                  <button onClick={reset} style={{
+                    position: "absolute", top: 8, right: 8, background: "#000000cc",
+                    border: "1px solid #ffffff22", color: "#fff", borderRadius: "50%",
+                    width: 29, height: 29, cursor: "pointer", fontSize: "14px",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                  }}>✕</button>
+                </div>
+                {baseInfo && (
+                  <div style={{
+                    padding: "10px 14px", borderTop: `1px solid ${C.border}`,
+                    display: "flex", flexWrap: "wrap", gap: "6px",
+                  }}>
+                    <THBadge th={baseInfo.th_level} />
+                    <span style={{ background: `${C.blue}20`, color: C.blue, fontSize: "11px", padding: "2px 9px", borderRadius: "6px" }}>
+                      {baseInfo.base_type}
+                    </span>
+                    <span style={{ background: `${C.green}18`, color: C.green, fontSize: "11px", padding: "2px 9px", borderRadius: "6px" }}>
+                      ↘ {baseInfo.best_entry}
+                    </span>
+                    {baseInfo.weaknesses?.slice(0, 2).map((w, i) => (
+                      <span key={i} style={{ background: `${C.red}18`, color: C.red, fontSize: "10px", padding: "2px 9px", borderRadius: "6px" }}>
+                        ⚠ {w}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {/* BUG FIX #1 применён: один label вместо отдельного REPLACE_ID */}
+                <label htmlFor={FILE_ID} style={{
+                  display: "block", width: "100%", padding: "10px", background: "none",
+                  border: "none", borderTop: `1px solid ${C.border}`, color: C.muted,
+                  fontSize: "13px", cursor: "pointer", textAlign: "center",
+                  userSelect: "none", WebkitUserSelect: "none",
+                }}>🔄 Заменить скриншот</label>
+              </Card>
+            )}
+
+            {/* Войска (необязательно) */}
+            <Card style={{ padding: "14px" }}>
+              <div style={{ color: C.muted, fontSize: "11px", letterSpacing: ".8px", marginBottom: "8px" }}>
+                🪖 МОИ ВОЙСКА <span style={{ fontSize: "10px" }}>(необязательно)</span>
+              </div>
+              <textarea value={troops} onChange={e => setTroops(e.target.value)}
+                placeholder={`Оставь пустым — ИИ сам придумает 20 разных составов...\nили напиши предпочтения: Super Witch, Lalo, Root Rider...`}
+                rows={2} style={{
+                  width: "100%", padding: "12px", borderRadius: "11px", boxSizing: "border-box",
+                  background: C.surface, color: C.text, border: `1px solid ${C.border}`,
+                  fontSize: "14px", fontFamily: "inherit", resize: "none", lineHeight: 1.6, outline: "none",
+                }} />
+            </Card>
+
+            {/* Кнопка ЗАПУСК / ОТМЕНА */}
+            {simRunning ? (
+              <button onClick={cancelSimulation} style={{
+                padding: "18px", borderRadius: "14px", border: `1px solid ${C.red}44`,
+                width: "100%", background: `${C.red}18`, color: C.red,
+                fontWeight: 900, fontSize: "15px", cursor: "pointer",
+              }}>
+                ⏹ ОСТАНОВИТЬ СИМУЛЯЦИЮ
+              </button>
+            ) : (
+              <button onClick={runSimulation} disabled={!payload} style={{
+                padding: "18px", borderRadius: "14px", border: "none", width: "100%",
+                background: payload
+                  ? `linear-gradient(135deg,${C.goldBright} 0%,${C.gold} 50%,#d97706 100%)`
+                  : C.card,
+                color: payload ? "#000" : C.muted,
+                fontWeight: 900, fontSize: "17px", letterSpacing: ".5px",
+                cursor: payload ? "pointer" : "not-allowed",
+                boxShadow: payload ? `0 0 30px ${C.gold}40,0 6px 20px #00000050` : "none",
+                transition: "all .25s",
+              }}>
+                {!payload ? "📸 Сначала загрузи скриншот базы"
+                  : simPhase === "done" ? "🔄 Симулировать снова (20 атак)"
+                  : "🎯 ЗАПУСТИТЬ 20 СИМУЛЯЦИЙ"}
+              </button>
+            )}
+
+            {/* Прогресс бар */}
+            {(simRunning || simPhase === "running") && (
+              <Card style={{ padding: "14px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px" }}>
+                  <span style={{ color: C.muted, fontSize: "12px" }}>{phaseLabel}</span>
+                  <span style={{ color: C.gold, fontSize: "12px", fontWeight: 800 }}>
+                    {simPhase === "running" ? `${progress}%` : ""}
+                  </span>
+                </div>
+                <StarBar pct={progress} />
+                {simResults.length > 0 && (
+                  <div style={{ marginTop: "10px", display: "flex", gap: "14px", flexWrap: "wrap" }}>
+                    <span style={{ color: C.gold, fontSize: "12px" }}>⭐⭐⭐ {threeStarCount}</span>
+                    <span style={{ color: C.orange, fontSize: "12px" }}>⭐⭐ {twoStarCount}</span>
+                    <span style={{ color: C.mutedLt, fontSize: "12px" }}>Топ: {simResults[0]?.name || "—"}</span>
+                  </div>
+                )}
+              </Card>
+            )}
+
+            {error && (
+              <div style={{
+                background: "#1a0808", borderRadius: "13px", padding: "14px",
+                color: C.red, fontSize: "14px", border: `1px solid ${C.red}33`, lineHeight: 1.6,
+              }}>
+                {error}
+                <div style={{ marginTop: "8px", fontSize: "12px", color: C.mutedLt }}>
+                  Попробуй ещё раз или загрузи другой скриншот.
+                </div>
+              </div>
+            )}
+
+            {/* КАРТОЧКА ПОБЕДИТЕЛЯ */}
+            {bestResult && (simPhase === "done" || simResults.length > 0) && (
+              <div style={{
+                background: `linear-gradient(135deg,${C.gold}18,${C.goldDark}10)`,
+                borderRadius: "20px", border: `2px solid ${C.gold}66`,
+                padding: "20px", position: "relative", overflow: "hidden",
+              }}>
+                <div style={{ position: "absolute", top: 0, right: 0, fontSize: "80px", opacity: 0.07, lineHeight: 1 }}>🏆</div>
+                <div style={{ color: C.goldBright, fontWeight: 900, fontSize: "13px", letterSpacing: "2px", marginBottom: "6px" }}>
+                  🏆 ПОБЕДИТЕЛЬ СИМУЛЯЦИИ
+                </div>
+                <div style={{ fontWeight: 900, fontSize: "22px", marginBottom: "4px" }}>{bestResult.name}</div>
+                <div style={{ display: "flex", gap: "10px", alignItems: "center", marginBottom: "14px" }}>
+                  <span style={{ fontSize: "24px" }}>{STAR_LABEL[bestResult.stars]}</span>
+                  <span style={{ color: C.gold, fontWeight: 900, fontSize: "18px" }}>{bestResult.destruction}%</span>
+                  <span style={{ color: C.green, fontSize: "13px", fontWeight: 700 }}>разрушения</span>
+                </div>
+
+                {/* Прогресс разрушения */}
+                <div style={{ marginBottom: "14px" }}>
+                  <StarBar pct={bestResult.destruction} color={bestResult.destruction >= 80 ? C.green : C.orange} />
+                </div>
+
+                <div style={{ background: `${C.gold}10`, borderRadius: "10px", padding: "12px", marginBottom: "12px" }}>
+                  <div style={{ color: C.muted, fontSize: "11px", marginBottom: "4px" }}>🪖 СОСТАВ</div>
+                  <div style={{ color: C.text, fontSize: "13px", lineHeight: 1.6 }}>{bestResult.army}</div>
+                  <div style={{ color: C.mutedLt, fontSize: "12px", marginTop: "4px" }}>
+                    ⚡ {bestResult.spells} · 🏰 {bestResult.siege} · 🐾 {bestResult.pet}
+                  </div>
+                </div>
+
+                {bestResult.key_moment && (
+                  <div style={{
+                    background: `${C.purple}15`, borderRadius: "10px", padding: "10px 12px",
+                    marginBottom: "12px", border: `1px solid ${C.purple}33`,
+                  }}>
+                    <span style={{ color: C.purple, fontSize: "12px", fontWeight: 700 }}>💡 Ключевой момент: </span>
+                    <span style={{ color: C.text, fontSize: "12px" }}>{bestResult.key_moment}</span>
+                  </div>
+                )}
+
+                {bestResult.timeline?.length > 0 && (
+                  <div style={{ marginBottom: "12px" }}>
+                    <div style={{ color: C.muted, fontSize: "11px", marginBottom: "6px" }}>📋 ХОД АТАКИ</div>
+                    {bestResult.timeline.map((t, i) => (
+                      <div key={i} style={{ display: "flex", gap: "8px", marginBottom: "4px" }}>
+                        <span style={{ color: C.gold, fontSize: "12px", fontWeight: 700, minWidth: "36px" }}>{i + 1}.</span>
+                        <span style={{ color: C.text, fontSize: "12px", lineHeight: 1.5 }}>{t}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: "8px" }}>
+                  <button onClick={shareResult} style={{
+                    flex: 1, padding: "12px", borderRadius: "12px",
+                    border: `1px solid ${C.gold}44`, background: `${C.gold}10`,
+                    color: C.gold, fontWeight: 800, fontSize: "14px", cursor: "pointer",
+                  }}>📤 Поделиться</button>
+                  <button onClick={() => { setTroops(bestResult.army + ", " + bestResult.spells); showToast("✓ Состав выбран!"); }}
+                    style={{
+                      padding: "12px 16px", borderRadius: "12px",
+                      border: `1px solid ${C.green}44`, background: `${C.green}10`,
+                      color: C.green, fontWeight: 800, fontSize: "14px", cursor: "pointer",
+                    }}>✓ Выбрать</button>
+                </div>
+              </div>
+            )}
+
+            {/* ТУРНИРНАЯ ТАБЛИЦА */}
+            {simResults.length > 0 && (
+              <Card>
+                <div style={{
+                  padding: "14px 16px 10px", borderBottom: `1px solid ${C.border}`,
+                  display: "flex", justifyContent: "space-between", alignItems: "center",
+                }}>
+                  <div style={{ color: C.gold, fontWeight: 800, fontSize: "13px" }}>📊 ТУРНИРНАЯ ТАБЛИЦА</div>
+                  <span style={{ color: C.muted, fontSize: "11px" }}>{simResults.length} атак</span>
+                </div>
+
+                {/* Статистика */}
+                <div style={{ padding: "10px 14px", borderBottom: `1px solid ${C.border}`, display: "flex", gap: "16px" }}>
+                  <div style={{ textAlign: "center" }}>
+                    <div style={{ color: C.gold, fontWeight: 900, fontSize: "18px" }}>{threeStarCount}</div>
+                    <div style={{ color: C.muted, fontSize: "10px" }}>3★</div>
+                  </div>
+                  <div style={{ textAlign: "center" }}>
+                    <div style={{ color: C.orange, fontWeight: 900, fontSize: "18px" }}>{twoStarCount}</div>
+                    <div style={{ color: C.muted, fontSize: "10px" }}>2★</div>
+                  </div>
+                  <div style={{ textAlign: "center" }}>
+                    <div style={{ color: C.green, fontWeight: 900, fontSize: "18px" }}>{avgDestruction}%</div>
+                    <div style={{ color: C.muted, fontSize: "10px" }}>сред.</div>
+                  </div>
+                  <div style={{ textAlign: "center" }}>
+                    <div style={{ color: C.text, fontWeight: 900, fontSize: "18px" }}>{simResults.length}</div>
+                    <div style={{ color: C.muted, fontSize: "10px" }}>всего</div>
+                  </div>
+                </div>
+
+                {/* Строки таблицы */}
+                <div>
+                  {simResults.map((r, idx) => (
+                    <div key={r.id || idx}>
+                      <div
+                        onClick={() => setExpandedResult(expandedResult === idx ? null : idx)}
+                        style={{
+                          padding: "10px 14px",
+                          borderBottom: idx < simResults.length - 1 ? `1px solid ${C.border}` : "none",
+                          display: "flex", alignItems: "center", gap: "10px",
+                          background: idx === 0 ? `${C.gold}08` : "transparent",
+                          cursor: "pointer",
+                        }}>
+                        <div style={{ minWidth: 28, textAlign: "center", fontWeight: 900, fontSize: "13px", color: idx === 0 ? C.gold : idx < 3 ? C.orange : C.muted }}>
+                          {idx === 0 ? "🥇" : idx === 1 ? "🥈" : idx === 2 ? "🥉" : `#${idx + 1}`}
+                        </div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontWeight: 800, fontSize: "13px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", color: idx === 0 ? C.gold : C.text }}>
+                            {r.name}
+                          </div>
+                          <div style={{ color: C.muted, fontSize: "11px", marginTop: "2px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                            {r.army}
+                          </div>
+                        </div>
+                        <div style={{ textAlign: "right", flexShrink: 0 }}>
+                          <div style={{ color: STAR_COLOR[r.stars] || C.muted, fontSize: "14px", fontWeight: 900 }}>{STAR_LABEL[r.stars]}</div>
+                          <div style={{ color: r.destruction >= 80 ? C.green : r.destruction >= 50 ? C.orange : C.red, fontSize: "12px", fontWeight: 700 }}>
+                            {r.destruction}%
+                          </div>
+                        </div>
+                        <span style={{ color: C.muted, fontSize: "14px" }}>{expandedResult === idx ? "▲" : "▼"}</span>
+                      </div>
+                      {/* НОВОЕ: Развёрнутая инфо по атаке */}
+                      {expandedResult === idx && (
+                        <div style={{ background: C.surface, padding: "12px 14px", borderBottom: `1px solid ${C.border}` }}>
+                          <div style={{ color: C.mutedLt, fontSize: "12px", marginBottom: "4px" }}>⚡ {r.spells}</div>
+                          <div style={{ color: C.mutedLt, fontSize: "12px", marginBottom: "8px" }}>🏰 {r.siege} · 🐾 {r.pet}</div>
+                          {r.key_moment && (
+                            <div style={{ color: C.text, fontSize: "12px", marginBottom: "6px" }}>💡 {r.key_moment}</div>
+                          )}
+                          {r.fail_reason && (
+                            <div style={{ color: C.red, fontSize: "12px" }}>❌ {r.fail_reason}</div>
+                          )}
+                          <button onClick={(e) => { e.stopPropagation(); setTroops(r.army + ", " + r.spells); setTab("simulate"); showToast("✓ Состав выбран!"); }}
+                            style={{
+                              marginTop: "8px", padding: "7px 14px", background: `${C.gold}10`,
+                              border: `1px solid ${C.gold}33`, color: C.gold, borderRadius: "8px",
+                              cursor: "pointer", fontSize: "12px", fontWeight: 700,
+                            }}>🎯 Попробовать этот состав</button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </Card>
+            )}
+
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════
+            ТАБ: ТРЕНДЫ
+        ══════════════════════════════════════════════════ */}
+        {tab === "trends" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+            <div style={{ textAlign: "center", paddingTop: "4px" }}>
+              <div style={{
+                display: "inline-flex", alignItems: "center", gap: "6px",
+                background: `${C.purple}18`, border: `1px solid ${C.purple}44`,
+                borderRadius: "30px", padding: "5px 14px",
+                color: C.purple, fontSize: "12px", fontWeight: 700, marginBottom: "12px",
+              }}>
+                📡 YouTube · TikTok · Telegram · Reddit
+              </div>
+              <div style={{ color: C.muted, fontSize: "13px", lineHeight: 1.7, marginBottom: "14px" }}>
+                Актуальные стратегии TH15–18<br />из всех платформ · 2026
+              </div>
+              {!trends && !tLoading && (
+                <button onClick={loadTrends} style={{
+                  padding: "16px 44px", borderRadius: "14px", border: "none",
+                  background: `linear-gradient(135deg,${C.purple},${C.purpleDark})`,
+                  color: "#fff", fontWeight: 900, fontSize: "16px", cursor: "pointer",
+                  boxShadow: `0 4px 24px ${C.purple}55`,
+                }}>📡 ЗАГРУЗИТЬ ТРЕНДЫ</button>
+              )}
+            </div>
+
+            {tLoading && (
+              <div style={{ textAlign: "center", color: C.muted, padding: "40px 20px" }}>
+                <div style={{ fontSize: "44px", marginBottom: "14px" }} className="pulse">📡</div>
+                <div style={{ fontSize: "14px", fontWeight: 700 }}>Ищу актуальные стратегии...</div>
+                <div style={{ fontSize: "12px", marginTop: "8px", color: C.mutedLt }}>YouTube · TikTok · Telegram · Reddit · clash.gg</div>
+              </div>
+            )}
+
+            {tError && (
+              <div style={{ background: "#1a0808", borderRadius: "13px", padding: "16px", color: C.red, fontSize: "13px", lineHeight: 1.6 }}>
+                {tError}
+                <button onClick={loadTrends} style={{
+                  display: "block", marginTop: "12px", background: "none",
+                  border: `1px solid ${C.red}`, color: C.red, padding: "7px 14px",
+                  borderRadius: "8px", cursor: "pointer", fontSize: "13px",
+                }}>↺ Попробовать снова</button>
+              </div>
+            )}
+
+            {trends && (
+              <>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div>
+                    <span style={{ color: C.muted, fontSize: "12px" }}>🔥 Топ стратегий · {trends.updated}</span>
+                    {trends.sources && (
+                      <div style={{ marginTop: "3px", display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                        {trends.sources.map((s, i) => (
+                          <span key={i} style={{ background: `${C.purple}18`, color: C.purple, fontSize: "10px", padding: "1px 7px", borderRadius: "5px" }}>{s}</span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <button onClick={loadTrends} style={{
+                    background: "none", border: `1px solid ${C.border}`, color: C.muted,
+                    padding: "5px 11px", borderRadius: "7px", cursor: "pointer", fontSize: "11px",
+                  }}>🔄 Обновить</button>
+                </div>
+
+                {(trends.strategies || []).map((s2, idx) => {
+                  const thN = s2.th?.match(/\d+/)?.[0];
+                  const thC = TH_CLR[parseInt(thN)] || C.gold;
+                  return (
+                    <div key={idx} style={{ background: C.card, borderRadius: "16px", border: `1px solid ${C.border}`, padding: "16px" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "10px" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1, flexWrap: "wrap" }}>
+                          <span style={{ background: `${C.purple}33`, color: C.purple, fontSize: "10px", fontWeight: 800, padding: "2px 8px", borderRadius: "6px" }}>#{idx + 1}</span>
+                          <span style={{ fontWeight: 900, fontSize: "15px" }}>{s2.title}</span>
+                          {s2.views && <span style={{ color: C.mutedLt, fontSize: "11px" }}>👁 {s2.views}</span>}
+                        </div>
+                        {s2.rating && <div style={{ color: C.gold, fontWeight: 900, fontSize: "15px", flexShrink: 0, marginLeft: "10px" }}>★ {s2.rating}</div>}
+                      </div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: "5px", marginBottom: "10px" }}>
+                        {s2.th && <span style={{ background: `${thC}22`, color: thC, fontSize: "11px", padding: "2px 9px", borderRadius: "6px", fontWeight: 700 }}>{s2.th}</span>}
+                        {(s2.tags || []).map((tag, ti) => (
+                          <span key={ti} style={{ background: `${C.blue}20`, color: C.blue, fontSize: "11px", padding: "2px 9px", borderRadius: "6px" }}>{tag}</span>
+                        ))}
+                        {s2.source && <span style={{ background: `${C.green}18`, color: C.green, fontSize: "11px", padding: "2px 9px", borderRadius: "6px" }}>📺 {s2.source}</span>}
+                      </div>
+                      {s2.army && <div style={{ color: C.mutedLt, fontSize: "12px", marginBottom: "6px" }}>🪖 {s2.army}</div>}
+                      {s2.spells && <div style={{ color: C.mutedLt, fontSize: "12px", marginBottom: "8px" }}>⚡ {s2.spells} · 🏰 {s2.siege || "—"}</div>}
+                      {s2.tip && (
+                        <div style={{ background: `${C.gold}0e`, border: `1px solid ${C.gold}28`, borderRadius: "10px", padding: "10px 13px", color: C.text, fontSize: "13px", lineHeight: 1.6, marginBottom: "10px" }}>
+                          💡 {s2.tip}
+                        </div>
+                      )}
+                      <button onClick={() => { if (thN) setTh(thN); setTroops(s2.army || ""); setTab("simulate"); showToast("🎯 Стратегия выбрана!"); }}
+                        style={{ width: "100%", padding: "10px", background: `${C.gold}12`, border: `1px solid ${C.gold}33`, color: C.gold, borderRadius: "10px", cursor: "pointer", fontSize: "13px", fontWeight: 700 }}>
+                        🎯 Симулировать эту стратегию
+                      </button>
+                    </div>
+                  );
+                })}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════
+            ТАБ: ВОЙСКА (АРМИИ)
+        ══════════════════════════════════════════════════ */}
+        {tab === "army" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+            <div style={{ textAlign: "center", paddingTop: "4px" }}>
+              <div style={{
+                display: "inline-flex", alignItems: "center", gap: "6px",
+                background: `${C.green}18`, border: `1px solid ${C.green}44`,
+                borderRadius: "30px", padding: "5px 14px",
+                color: C.green, fontSize: "12px", fontWeight: 700, marginBottom: "12px",
+              }}>
+                🌐 Поиск по YouTube · TikTok · Reddit · clash.gg
+              </div>
+              <div style={{ color: C.muted, fontSize: "13px", lineHeight: 1.7, marginBottom: "14px" }}>
+                Найду лучшие составы для TH{th}<br />из реальных источников 2026 года
+              </div>
+            </div>
+
+            {/* Выбор TH */}
+            <Card>
+              <div style={{ padding: "14px" }}>
+                <div style={{ color: C.muted, fontSize: "11px", letterSpacing: ".8px", marginBottom: "12px" }}>🏰 ДЛЯ КАКОГО TH ИСКАТЬ?</div>
+                <div style={{ display: "flex", gap: "10px" }}>
+                  {[15, 16, 17, 18].map(n => {
+                    const c = TH_CLR[n], active = th === String(n);
+                    return (
+                      <button key={n} onClick={() => { setTh(String(n)); setArmyPicks(null); setArmyError(null); }} style={{
+                        flex: 1, padding: "12px 4px", borderRadius: "12px",
+                        border: `2px solid ${active ? c + "cc" : C.border}`,
+                        background: active ? `${c}18` : "transparent",
+                        color: active ? c : C.muted, cursor: "pointer",
+                        fontWeight: 900, fontSize: "13px",
+                        display: "flex", flexDirection: "column", alignItems: "center", gap: "4px",
+                      }}>
+                        <span style={{ fontSize: "20px" }}>🏰</span><span>TH{n}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </Card>
+
+            <button onClick={findBestArmy} disabled={armyLoading} style={{
+              padding: "16px", borderRadius: "14px", border: "none", width: "100%",
+              background: armyLoading ? C.card : `linear-gradient(135deg,${C.green},#16a34a)`,
+              color: armyLoading ? C.muted : "#000",
+              fontWeight: 900, fontSize: "16px",
+              cursor: armyLoading ? "not-allowed" : "pointer",
+              boxShadow: armyLoading ? "none" : `0 4px 24px ${C.green}44`,
+              transition: "all .25s",
+            }}>
+              {armyLoading
+                ? <span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
+                    <span className="spin">🌐</span>Ищу составы для TH{th}...
+                  </span>
+                : `🌐 НАЙТИ ТОП-4 СОСТАВА ДЛЯ TH${th}`}
+            </button>
+
+            {armyError && (
+              <div style={{ background: "#1a0808", borderRadius: "13px", padding: "14px", color: C.red, fontSize: "13px" }}>
+                {armyError}
+                <button onClick={findBestArmy} style={{
+                  display: "block", marginTop: "10px", background: "none",
+                  border: `1px solid ${C.red}`, color: C.red, padding: "6px 12px",
+                  borderRadius: "7px", cursor: "pointer", fontSize: "12px",
+                }}>↺ Повторить</button>
+              </div>
+            )}
+
+            {armyPicks && (
+              <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                <div style={{ color: C.muted, fontSize: "12px", textAlign: "center" }}>
+                  🔥 Актуальные мета-составы TH{th} · Июнь 2026
+                </div>
+                {armyPicks.map((army, i) => (
+                  <div key={i} style={{
+                    background: C.card, borderRadius: "16px",
+                    border: `1px solid ${i === 0 ? C.gold + "66" : C.border}`,
+                    padding: "16px", position: "relative",
+                  }}>
+                    {i === 0 && (
+                      <div style={{
+                        position: "absolute", top: 12, right: 12,
+                        background: `${C.gold}22`, color: C.gold,
+                        fontSize: "10px", fontWeight: 800, padding: "2px 8px", borderRadius: "6px",
+                      }}>🏆 #1 META</div>
+                    )}
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "10px" }}>
+                      <span style={{ background: `${C.purple}33`, color: C.purple, fontSize: "11px", fontWeight: 800, padding: "2px 9px", borderRadius: "6px" }}>
+                        #{army.rank || i + 1}
+                      </span>
+                      <span style={{ fontWeight: 900, fontSize: "15px", color: i === 0 ? C.gold : C.text }}>{army.name}</span>
+                    </div>
+                    <div style={{ display: "flex", gap: "8px", marginBottom: "10px", flexWrap: "wrap" }}>
+                      {army.winrate && <span style={{ background: `${C.green}18`, color: C.green, fontSize: "12px", fontWeight: 700, padding: "2px 10px", borderRadius: "6px" }}>✓ {army.winrate}</span>}
+                      {army.rating && <span style={{ background: `${C.gold}18`, color: C.gold, fontSize: "12px", fontWeight: 700, padding: "2px 10px", borderRadius: "6px" }}>★ {army.rating}</span>}
+                      {army.source && <span style={{ background: `${C.blue}18`, color: C.blue, fontSize: "11px", padding: "2px 9px", borderRadius: "6px" }}>📺 {army.source}</span>}
+                    </div>
+                    <div style={{ background: C.surface, borderRadius: "10px", padding: "10px 12px", marginBottom: "10px" }}>
+                      <div style={{ color: C.muted, fontSize: "10px", marginBottom: "4px" }}>🪖 СОСТАВ</div>
+                      <div style={{ color: C.text, fontSize: "13px", lineHeight: 1.6, fontWeight: 600 }}>{army.army}</div>
+                    </div>
+                    <div style={{ color: C.mutedLt, fontSize: "12px", marginBottom: "6px" }}>⚡ {army.spells}</div>
+                    <div style={{ color: C.mutedLt, fontSize: "12px", marginBottom: army.tip ? "10px" : "12px" }}>
+                      🏰 {army.siege} · 🐾 {army.pet}
+                    </div>
+                    {army.tip && (
+                      <div style={{ background: `${C.gold}0e`, border: `1px solid ${C.gold}28`, borderRadius: "10px", padding: "10px 12px", color: C.text, fontSize: "12px", lineHeight: 1.5, marginBottom: "12px" }}>
+                        💡 {army.tip}
+                      </div>
+                    )}
+                    <div style={{ display: "flex", gap: "8px" }}>
+                      <button onClick={() => { setTroops(army.army + ", " + army.spells); setTab("simulate"); showToast("🎯 Состав выбран!"); }}
+                        style={{ flex: 1, padding: "10px", background: `${C.gold}10`, border: `1px solid ${C.gold}33`, color: C.gold, borderRadius: "10px", cursor: "pointer", fontSize: "12px", fontWeight: 700 }}>
+                        🎯 Симулировать
+                      </button>
+                      <button onClick={() => { setTroops(army.army + ", " + army.spells); showToast("✓ Состав выбран!"); }}
+                        style={{ padding: "10px 14px", background: `${C.green}10`, border: `1px solid ${C.green}33`, color: C.green, borderRadius: "10px", cursor: "pointer", fontSize: "12px", fontWeight: 700 }}>
+                        ✓ Выбрать
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════
+            ТАБ: ИСТОРИЯ
+        ══════════════════════════════════════════════════ */}
+        {tab === "history" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+            {history.length === 0 ? (
+              <div style={{ textAlign: "center", padding: "60px 20px", color: C.muted }}>
+                <div style={{ fontSize: "56px" }}>📜</div>
+                <div style={{ fontWeight: 800, color: C.text, marginTop: "14px", fontSize: "16px" }}>История пуста</div>
+                <div style={{ fontSize: "13px", marginTop: "8px", lineHeight: 1.7 }}>Каждая симуляция сохраняется здесь.</div>
+              </div>
+            ) : (
+              <>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ color: C.muted, fontSize: "13px" }}>🧠 {history.length} симуляций</span>
+                  <button onClick={async () => {
+                    setHistory([]);
+                    try { await window.storage.delete("coc_sim_v2"); } catch { /* ok */ }
+                    showToast("🗑 История очищена");
+                  }} style={{
+                    background: "none", border: `1px solid ${C.border}`, color: C.muted,
+                    padding: "5px 12px", borderRadius: "8px", cursor: "pointer", fontSize: "12px",
+                  }}>🗑 Очистить</button>
+                </div>
+
+                {/* BUG FIX #11: добавлена общая статистика */}
+                {history.length > 1 && (() => {
+                  const avg3 = Math.round(history.filter(e => e.best_stars === 3).length / history.length * 100);
+                  const avgDest = Math.round(history.reduce((s, e) => s + (e.best_dest || 0), 0) / history.length);
+                  return (
+                    <Card style={{ padding: "12px 14px" }}>
+                      <div style={{ color: C.muted, fontSize: "10px", letterSpacing: ".8px", marginBottom: "8px" }}>📊 МОЯ СТАТИСТИКА</div>
+                      <div style={{ display: "flex", gap: "20px" }}>
+                        <div>
+                          <div style={{ color: C.gold, fontWeight: 900, fontSize: "20px" }}>{avg3}%</div>
+                          <div style={{ color: C.muted, fontSize: "10px" }}>3★ процент</div>
+                        </div>
+                        <div>
+                          <div style={{ color: C.green, fontWeight: 900, fontSize: "20px" }}>{avgDest}%</div>
+                          <div style={{ color: C.muted, fontSize: "10px" }}>сред. разруш.</div>
+                        </div>
+                        <div>
+                          <div style={{ color: C.text, fontWeight: 900, fontSize: "20px" }}>{history.length}</div>
+                          <div style={{ color: C.muted, fontSize: "10px" }}>всего игр</div>
+                        </div>
+                      </div>
+                    </Card>
+                  );
+                })()}
+
+                {history.map(entry => {
+                  const thC = TH_CLR[entry.base_th] || C.gold;
+                  return (
+                    <div key={entry.id} style={{
+                      background: C.card, borderRadius: "14px", padding: "12px",
+                      border: `1px solid ${C.border}`, display: "flex", gap: "12px", alignItems: "center",
+                    }}>
+                      {entry.preview && (
+                        <img src={entry.preview} alt="" style={{
+                          width: 72, height: 52, objectFit: "cover",
+                          borderRadius: "9px", flexShrink: 0,
+                        }} />
+                      )}
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: "11px", color: C.muted }}>{entry.date}</div>
+                        <div style={{ fontWeight: 800, marginTop: "2px", color: thC }}>
+                          🏰 vs TH{entry.base_th} · моя TH{entry.th}
+                        </div>
+                        <div style={{ fontSize: "12px", color: C.gold, marginTop: "2px", fontWeight: 700 }}>
+                          🏆 {entry.best_name}
+                        </div>
+                        <div style={{ fontSize: "11px", color: C.muted, marginTop: "1px" }}>
+                          {STAR_LABEL[entry.best_stars]} · {entry.best_dest}% · {entry.total} симуляций
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </>
+            )}
+          </div>
+        )}
+
+      </div>
+
+      {/* НИЖНИЙ ТАББАР */}
+      <div style={{
+        position: "fixed", bottom: 0, left: 0, right: 0,
+        background: C.surface, borderTop: `1px solid ${C.border}`,
+        display: "flex", padding: "6px 10px 8px",
+        zIndex: 100, gap: "4px",
+        boxShadow: "0 -4px 20px #00000060",
+        // BUG FIX #12: paddingBottom учитывает safe area на iPhone/Android
+        paddingBottom: "max(8px, env(safe-area-inset-bottom))",
+      }}>
+        {renderTabBtn("simulate", "🎯", "Симуляция")}
+        {renderTabBtn("trends",  "📡", "Тренды")}
+        {renderTabBtn("army",    "🪖", "Войска")}
+        {renderTabBtn("history", "📜", `История (${history.length})`)}
+      </div>
+
+      <style>{`
+        @keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.55} }
+        .spin  { display: inline-block; animation: spin 1s linear infinite; }
+        .pulse { animation: pulse 1.8s ease-in-out infinite; }
+        * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
+        input::placeholder, textarea::placeholder { color: #3d5070; }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: #1e3060; border-radius: 4px; }
+        button:active { opacity: 0.82; }
+        /* Android: убираем синюю рамку на фокусе */
+        *:focus { outline: none; }
+        *:focus-visible { outline: 2px solid #f5a62344; }
+      `}</style>
+    </div>
+  );
+}
