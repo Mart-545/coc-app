@@ -1,0 +1,20 @@
+{
+  "name": "CoC Attack Simulator",
+  "short_name": "CoCsim",
+  "description": "Симулятор атак Clash of Clans — 20 атак, лучший состав, AI-анализ базы",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#04091a",
+  "theme_color": "#f5a623",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'><rect width='192' height='192' rx='32' fill='%23080f22'/><text x='50%25' y='55%25' font-size='110' text-anchor='middle' dominant-baseline='middle'>⚔️</text></svg>",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["games", "utilities"],
+  "lang": "ru"
+}
