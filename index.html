@@ -154,7 +154,7 @@
           const body={model:"claude-sonnet-4-6",max_tokens:maxTokens,messages};
           if(useSearch)body.tools=[{type:"web_search_20250305",name:"web_search"}];
           const resp=await fetch("https://api.anthropic.com/v1/messages",{
-            method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body),
+            method:"POST",headers:{"Content-Type":"application/json","x-api-key":"ВСТАВЬ_СВОЙ_КЛЮЧ_СЮДА","anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},body:JSON.stringify(body),
           });
           if(!resp.ok){const e=await resp.json().catch(()=>({}));throw new Error(e?.error?.message||`Ошибка ${resp.status}`);}
           const data=await resp.json();
@@ -203,6 +203,7 @@
 
     function App(){
       const[tab,setTab]=useState("simulate");
+      const[previews,setPreviews]=useState([]);
       const[preview,setPreview]=useState(null);
       const[payload,setPayload]=useState(null);
       const[th,setTh]=useState("15");
@@ -247,7 +248,13 @@
         const reader=new FileReader();
         reader.onload=(ev)=>{
           const url=ev.target.result;
-          setPreview(url);setPayload({kind:"base64",data:url.split(",")[1],mt:file.type});
+          setPreviews(prev=>{
+            if(prev.length>=5){setError("❌ Максимум 5 скриншотов");return prev;}
+            const newPreviews=[...prev,{url,data:url.split(",")[1],mt:file.type}];
+            setPreview(newPreviews[0].url);
+            setPayload({kind:"base64",data:newPreviews[0].data,mt:newPreviews[0].mt});
+            return newPreviews;
+          });
           setSimResults([]);setSimPhase("idle");setBestResult(null);
           setBaseInfo(null);setError(null);setShowUrl(false);setExpandedResult(null);
         };
@@ -264,8 +271,8 @@
       const onDragOver=useCallback((e)=>{e.preventDefault();setDragging(true);},[]);
       const onDragLeave=useCallback(()=>setDragging(false),[]);
       const onDrop=useCallback((e)=>{e.preventDefault();setDragging(false);const f=e.dataTransfer?.files?.[0];if(f)fromFile(f);},[fromFile]);
-      const fromUrl=()=>{const u=urlVal.trim();if(!u.startsWith("http")){setError("Ссылка должна начинаться с https://");return;}setPreview(u);setPayload({kind:"url",url:u});setSimResults([]);setSimPhase("idle");setBestResult(null);setBaseInfo(null);setError(null);setShowUrl(false);setExpandedResult(null);};
-      const reset=()=>{setPreview(null);setPayload(null);setSimResults([]);setSimPhase("idle");setBestResult(null);setBaseInfo(null);setError(null);setUrlVal("");setShowUrl(false);setExpandedResult(null);};
+      const fromUrl=()=>{const u=urlVal.trim();if(!u.startsWith("http")){setError("Ссылка должна начинаться с https://");return;}setPreview(u);setPayload({kind:"url",url:u});setPreviews([{url:u,kind:"url"}]);setSimResults([]);setSimPhase("idle");setBestResult(null);setBaseInfo(null);setError(null);setShowUrl(false);setExpandedResult(null);};
+      const reset=()=>{setPreview(null);setPreviews([]);setPayload(null);setSimResults([]);setSimPhase("idle");setBestResult(null);setBaseInfo(null);setError(null);setUrlVal("");setShowUrl(false);setExpandedResult(null);};
 
       const loadTrends=async()=>{
         setTLoading(true);setTError(null);setTrends(null);
@@ -413,7 +420,7 @@
                 </div>
 
                 {/* Upload */}
-                {!preview?(
+                {previews.length===0?(
                   <div style={{background:C.card,borderRadius:"16px",border:`1px solid ${C.border}`,overflow:"hidden"}}>
                     <div onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}
                       style={{margin:"12px",padding:"24px 18px",borderRadius:"12px",textAlign:"center",border:`2px dashed ${dragging?C.gold:C.border}`,background:dragging?`${C.gold}08`:"transparent",transition:"all .2s"}}>
@@ -438,10 +445,25 @@
                   </div>
                 ):(
                   <div style={{background:C.card,borderRadius:"16px",border:`1px solid ${C.gold}44`,overflow:"hidden"}}>
+                    {/* Main preview */}
                     <div style={{position:"relative",background:"#000"}}>
                       <img src={preview} alt="base" style={{width:"100%",maxHeight:"220px",objectFit:"contain",display:"block"}} onError={()=>setError("⚠️ Ошибка загрузки.")}/>
-                      <div style={{position:"absolute",top:8,left:8,background:"#00000099",borderRadius:"7px",padding:"3px 9px",fontSize:"11px",color:C.green,fontWeight:800}}>✓ БАЗА ЗАГРУЖЕНА</div>
+                      <div style={{position:"absolute",top:8,left:8,background:"#00000099",borderRadius:"7px",padding:"3px 9px",fontSize:"11px",color:C.green,fontWeight:800}}>✓ БАЗА ЗАГРУЖЕНА ({previews.length}/5)</div>
                       <button onClick={reset} style={{position:"absolute",top:8,right:8,background:"#000000cc",border:"1px solid #ffffff22",color:"#fff",borderRadius:"50%",width:29,height:29,cursor:"pointer",fontSize:"14px",display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+                    </div>
+                    {/* Thumbnails row */}
+                    <div style={{display:"flex",gap:"8px",padding:"10px 12px",borderTop:`1px solid ${C.border}`,overflowX:"auto"}}>
+                      {previews.map((p,i)=>(
+                        <div key={i} onClick={()=>{setPreview(p.url);setPayload(p.kind==="url"?{kind:"url",url:p.url}:{kind:"base64",data:p.data,mt:p.mt});}}
+                          style={{position:"relative",flexShrink:0,width:70,height:52,borderRadius:"8px",overflow:"hidden",border:`2px solid ${preview===p.url?C.gold:C.border}`,cursor:"pointer"}}>
+                          <img src={p.url} alt="" style={{width:"100%",height:"100%",objectFit:"cover"}}/>
+                          <button onClick={e=>{e.stopPropagation();const np=previews.filter((_,j)=>j!==i);setPreviews(np);if(np.length===0){reset();}else{setPreview(np[0].url);setPayload(np[0].kind==="url"?{kind:"url",url:np[0].url}:{kind:"base64",data:np[0].data,mt:np[0].mt});}}}
+                            style={{position:"absolute",top:1,right:1,background:"#000000cc",border:"none",color:"#fff",borderRadius:"50%",width:18,height:18,cursor:"pointer",fontSize:"10px",display:"flex",alignItems:"center",justifyContent:"center",padding:0}}>✕</button>
+                        </div>
+                      ))}
+                      {previews.length<5&&(
+                        <label htmlFor={FILE_ID} style={{flexShrink:0,width:70,height:52,borderRadius:"8px",border:`2px dashed ${C.border}`,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",color:C.muted,fontSize:"22px",userSelect:"none"}}>+</label>
+                      )}
                     </div>
                     {baseInfo&&(
                       <div style={{padding:"10px 14px",borderTop:`1px solid ${C.border}`,display:"flex",flexWrap:"wrap",gap:"6px"}}>
@@ -450,7 +472,6 @@
                         <span style={{background:`${C.green}18`,color:C.green,fontSize:"11px",padding:"2px 9px",borderRadius:"6px"}}>↘ {baseInfo.best_entry}</span>
                       </div>
                     )}
-                    <label htmlFor={FILE_ID} style={{display:"block",width:"100%",padding:"10px",background:"none",border:"none",borderTop:`1px solid ${C.border}`,color:C.muted,fontSize:"13px",cursor:"pointer",textAlign:"center",userSelect:"none"}}>🔄 Заменить скриншот</label>
                   </div>
                 )}
 
